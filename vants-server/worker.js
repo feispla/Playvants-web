@@ -189,12 +189,124 @@ function urlTorneos(lang, juego, estado) {
   return BASE_URL + '/' + lang + '/tournaments/' + juego + '/' + estado;
 }
 
+// ============================================================================
+// Capa de lectura D1 (base de datos de Cloudflare)
+// ============================================================================
+// Espejo de lectura pública de la base (vants-server/d1/schema.sql). El
+// Worker intenta SIEMPRE aquí primero (binding DB) y, si no está configurado
+// o la consulta falla, cae al proxy vantsdata de Neon de abajo. Misma forma
+// de respuesta que proxyConsulta ({ok, status, body, total}) para que las
+// rutas no cambien. Seguridad igual que vantsdata: whitelist estricta de
+// tablas y columnas, valores SIEMPRE parametrizados, solo SELECT.
+let DB = null; // binding D1 (env.DB); null = usar solo el proxy de Neon
+
+const D1_TABLAS = {
+  pt_games: ['slug', 'nombre', 'corto', 'activo', 'orden', 'logo_url', 'color'],
+  pt_torneos: ['id', 'slug', 'source', 'external_id', 'game_slug', 'nombre', 'descripcion', 'estado', 'major', 'region', 'location_type', 'prize_value', 'prize_currency', 'fee', 'max_teams', 'starts_at', 'ends_at', 'logo_url', 'banner_url', 'formato', 'reglas', 'is_demo', 'created_at', 'updated_at'],
+  pt_teams: ['id', 'slug', 'nombre', 'tag', 'game_slug', 'region', 'logo_url', 'is_demo', 'created_at'],
+  pt_matches: ['id', 'source', 'external_id', 'game_slug', 'tournament_id', 'equipo_a', 'equipo_b', 'score_a', 'score_b', 'estado', 'best_of', 'empieza_at', 'termino_at', 'is_demo', 'created_at'],
+  pt_articulos: ['id', 'slug', 'titulo', 'resumen', 'cuerpo', 'autor', 'game_slug', 'estado', 'publicado_at', 'is_demo', 'created_at'],
+  pt_players: ['id', 'slug', 'source', 'external_id', 'nombre', 'game_slug', 'team_slug', 'rol', 'pais', 'bio', 'avatar_url', 'is_demo', 'created_at', 'updated_at'],
+  players: ['id', 'username', 'display_name', 'nombre', 'avatar_url', 'country', 'region', 'role', 'game', 'verified', 'rating', 'tipo', 'is_demo', 'created_at'],
+  tournament_teams: ['id', 'tournament_id', 'game', 'name', 'tag', 'captain', 'region', 'auth0_sub', 'player_id', 'status', 'created_at'],
+  tournament_matches: ['id', 'tournament_id', 'game', 'ronda', 'slot', 'team_a', 'team_b', 'score_a', 'score_b', 'estado', 'ganador', 'updated_at'],
+  v_en_vivo: ['player_id', 'username', 'display_name', 'avatar_url', 'country', 'region', 'role', 'verified', 'rating', 'mmr', 'estado', 'juego', 'actualizado'],
+  v_torneo_equipos: ['id', 'tournament_id', 'game', 'name', 'tag', 'captain', 'region', 'status', 'created_at'],
+  v_torneo_bracket: ['tournament_id', 'game', 'ronda', 'slot', 'team_a', 'team_b', 'score_a', 'score_b', 'estado', 'ganador', 'updated_at'],
+};
+
+const D1_IDENT = /^[a-z_][a-z0-9_]*$/;
+const D1_FILTROS = new Set(['eq', 'neq', 'is', 'ilike']);
+
+function d1Col(tabla, col) {
+  if (!D1_IDENT.test(col)) throw new Error('columna invalida: ' + col);
+  if (!D1_TABLAS[tabla].includes(col)) throw new Error('columna no permitida en ' + tabla + ': ' + col);
+  return col;
+}
+
+async function d1Consulta(tabla, params, conCount) {
+  const columnas = D1_TABLAS[tabla];
+  if (!columnas) throw new Error('tabla no permitida: ' + tabla);
+
+  const where = [];
+  const binds = [];
+  let orden = null;
+  let limite = null;
+  let offset = null;
+  let select = null;
+
+  for (const [clave, valor] of Object.entries(params || {})) {
+    if (clave === 'order') { orden = String(valor); continue; }
+    if (clave === 'limit') { limite = Math.max(1, Math.min(1000, parseInt(valor, 10) || 100)); continue; }
+    if (clave === 'offset') { offset = Math.max(0, parseInt(valor, 10) || 0); continue; }
+    if (clave === 'select') { select = String(valor); continue; }
+    if (clave === '_count') continue;
+    const punto = clave.lastIndexOf('.');
+    const col = punto > 0 ? clave.slice(0, punto) : clave;
+    const op = punto > 0 ? clave.slice(punto + 1) : 'eq';
+    if (!D1_FILTROS.has(op)) throw new Error('filtro no soportado en D1: ' + clave);
+    d1Col(tabla, col);
+    if (op === 'is') {
+      const v = String(valor).toLowerCase();
+      if (v === 'null') where.push(col + ' IS NULL');
+      else { where.push(col + ' = ?'); binds.push(v === 'true' ? 1 : 0); }
+    } else if (op === 'ilike') {
+      where.push(col + ' LIKE ?'); binds.push(String(valor));
+    } else {
+      where.push(col + (op === 'neq' ? ' != ?' : ' = ?'));
+      binds.push(valor);
+    }
+  }
+
+  let lista = '*';
+  if (select && select !== '*') {
+    lista = select.split(',').map((c) => d1Col(tabla, c.trim())).join(', ');
+  }
+
+  let sql = 'SELECT ' + lista + ' FROM ' + tabla;
+  if (where.length) sql += ' WHERE ' + where.join(' AND ');
+  if (orden) {
+    const partes = String(orden).split('.');
+    const col = d1Col(tabla, partes[0]);
+    const dir = partes.includes('desc') ? 'DESC' : 'ASC';
+    const nulos = partes.includes('nullslast') ? ' NULLS LAST' : (partes.includes('nullsfirst') ? ' NULLS FIRST' : (dir === 'DESC' ? '' : ''));
+    sql += ' ORDER BY ' + col + ' ' + dir + nulos;
+  }
+  const argsTotales = binds.slice();
+  if (limite != null) {
+    sql += ' LIMIT ?';
+    binds.push(limite);
+    if (offset != null) { sql += ' OFFSET ?'; binds.push(offset); }
+  }
+
+  const res = await DB.prepare(sql).bind(...binds).all();
+  const body = Array.isArray(res.results) ? res.results : [];
+  let total = null;
+  if (conCount) {
+    let sqlCount = 'SELECT COUNT(*) AS n FROM ' + tabla;
+    if (where.length) sqlCount += ' WHERE ' + where.join(' AND ');
+    const c = await DB.prepare(sqlCount).bind(...argsTotales).first();
+    total = c && Number.isFinite(Number(c.n)) ? Number(c.n) : body.length;
+  }
+  return { ok: true, status: 200, body, total };
+}
+
 // Proxy público de lectura (vantsdata · Neon Function): whitelist de tablas,
 // strip de columnas sensibles, rate limit y Content-Range con _count=exact.
 // El Worker NUNCA guarda credenciales de la base (patrón de la casa).
 const PLAT_PROXY = 'https://br-sweet-shape-b42xhogj-vantsdata.compute.c-6.us-east-2.aws.neon.tech/';
 
 async function proxyConsulta(tabla, params, conCount) {
+  // 1) D1 de Cloudflare (base de datos propia, sin WAF externo). Si falla o
+  //    no está sembrada, el catch de abajo cae al proxy de Neon.
+  if (DB) {
+    try {
+      const d1 = await d1Consulta(tabla, params, conCount);
+      if (d1) return d1;
+    } catch (eD1) {
+      console.warn('[d1] ' + tabla + ' no disponible (' + (eD1 && eD1.message) + '), uso el proxy de Neon');
+    }
+  }
   const u = new URL(PLAT_PROXY);
   u.searchParams.set('table', tabla);
   for (const [k, v] of Object.entries(params || {})) u.searchParams.set(k, String(v));
@@ -1009,6 +1121,10 @@ async function fetchWorker(request, env, ctx) {
     const ip = request.headers.get('cf-connecting-ip') || 'desconocida';
     const ua = (request.headers.get('user-agent') || '').toLowerCase();
     const path = url.pathname.toLowerCase();
+
+    // Base de datos de lectura: D1 de Cloudflare si el binding DB está
+    // configurado en wrangler.toml; si no, todo sigue por el proxy de Neon.
+    DB = (env && env.DB) || null;
 
     // --- 1) Métodos permitidos (sitio de lectura + POST para la API)
     const method = request.method.toUpperCase();
@@ -2472,7 +2588,7 @@ async function fetchWorker(request, env, ctx) {
             }
             return { ok: true, data: jug };
           });
-        } else if (url.pathname === '/api/articles') {
+        } else if (url.pathname === '/api/articles' || /^\/api\/articles\/[a-z0-9-]+$/.test(url.pathname)) {
           if (/^\/api\/articles\/[a-z0-9-]+$/.test(url.pathname)) {
             const slug = url.pathname.split('/').pop();
             payload = await platLectura('articulo:' + slug, async () => {

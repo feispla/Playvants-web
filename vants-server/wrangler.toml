@@ -32,6 +32,21 @@ VANTS_BOT_URL = "https://br-sweet-shape-b42xhogj-vantsbot.compute.c-6.us-east-2.
 #   npx wrangler secret put VANTS_BUS_SECRET
 VANTS_BUS_URL = "https://vants-bus.vants.workers.dev"
 
+# Base de datos D1 de Cloudflare: espejo de LECTURA pública (vants-server/d1/).
+# El Worker la usa primero para /api/games, /api/tournaments, /api/matches,
+# /api/teams, /api/players, /api/articles y /api/search; si no está, cae al
+# proxy vantsdata de Neon (igual que hasta ahora).
+# Puesta en marcha (una sola vez, desde vants-server/):
+#   npx wrangler d1 create vants-db
+#   npx wrangler d1 execute vants-db --remote --file=./d1/schema.sql
+#   npx wrangler d1 execute vants-db --remote --file=./d1/sembrar-demo.sql
+#   → copia aquí el database_id que devuelva el create y descomenta el bloque
+# Datos reales después de activarla: node ../scripts/sincronizar-d1.mjs
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "vants-db"
+# database_id = "REEMPLAZA_CON_EL_ID_DE_LA_BASE"
+
 # DOMINIO PROPIO (vantsgg.com) — descomentar cuando la zona vantsgg.com esté
 # activa en la cuenta de Cloudflare (o añadirlo por panel: Workers & Pages ->
 # vants -> Configuración -> Dominios y rutas -> Agregar dominio personalizado):
